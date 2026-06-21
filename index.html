@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reflection</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: 'Helvetica Neue', sans-serif;
+    }
+
+    #setup {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .src-buttons {
+      display: flex;
+      gap: 10px;
+    }
+    .src-btn {
+      display: flex;
+      padding: 10px 20px;
+      background: transparent;
+      color: #555;
+      border: 1px solid #222;
+      border-radius: 10px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: color 0.15s, border-color 0.15s;
+      width: 100px;
+    }
+    .src-btn:hover { color: #aaa; border-color: #555; }
+    .src-btn:disabled { opacity: 0.25; cursor: not-allowed; }
+
+    #setup .hint { font-size: 10px; color: #2a2a2a; }
+
+    #fileInput { display: none; }
+
+    #canvas {
+      display: none;
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    #recDot {
+      display: none;
+      position: fixed;
+      top: 14px;
+      left: 14px;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #f33;
+      animation: blink 1.2s ease-in-out infinite;
+      pointer-events: none;
+      z-index: 10;
+    }
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.15; }
+    }
+  </style>
+</head>
+<body>
+
+<div id="setup">
+  <div class="src-buttons">
+    <button class="src-btn" id="btnCam">Camera</button>
+    <button class="src-btn" id="btnScreen">Screen</button>
+    <button class="src-btn" id="btnFile">Video file</button>
+  </div>
+  <p class="hint">Esc to exit</p>
+</div>
+
+<input type="file" id="fileInput" accept="video/*">
+<canvas id="canvas"></canvas>
+<div id="recDot"></div>
+
+<script>
+(() => {
+  const setup     = document.getElementById('setup');
+  const canvas    = document.getElementById('canvas');
+  const ctx       = canvas.getContext('2d');
+  const fileInput = document.getElementById('fileInput');
+  const recDot    = document.getElementById('recDot');
+
+  const buf    = document.createElement('canvas');
+  const bufCtx = buf.getContext('2d');
+
+  // ── 映像ソース ────────────────────────────────────────────────
+  let sourceMode = null;   // 'webcam' | 'screen' | 'file'
+  let srcVideo   = null;
+  let srcStream  = null;
+
+  let pipVideo  = null;
+  let pipStream = null;
+  let pipActive = false;
+
+  let rafId = null;
+
+  // ── エフェクト ────────────────────────────────────────────────
+  let rotAngle   = 0;
+  let frameScale = 0.70;
+
+  // ── オーディオ ────────────────────────────────────────────────
+  let audioCtx      = null;
+  let delayNode     = null;
+  let fbGain        = null;
+  let audioStream   = null;   // マイク使用時のストリーム
+  let audioOn       = false;
+  let recordingDest = null;
+  let delayTime     = 0.40;
+  let fbLevel       = 0.65;
+
+  async function toggleAudio() {
+    if (audioOn) { stopAudio(); return; }
+    try {
+      audioCtx  = new AudioContext();
+      delayNode = audioCtx.createDelay(10.0);
+      fbGain    = audioCtx.createGain();
+      delayNode.delayTime.value = delayTime;
+      fbGain.gain.value         = fbLevel;
+      recordingDest = audioCtx.createMediaStreamDestination();
+
+      // ディレイフィードバックループ
+      delayNode.connect(fbGain);
+      fbGain.connect(delayNode);
+      delayNode.connect(audioCtx.destination);
+      delayNode.connect(recordingDest);
+
+      let source;
+
+      if (sourceMode === 'file') {
+        // 動画ファイルの音声を Web Audio に引き渡す
+        srcVideo.muted = true;
+        source = audioCtx.createMediaElementSource(srcVideo);
+
+      } else if (sourceMode === 'screen') {
+        // 画面キャプチャの音声トラックがあればそれを使う、なければマイク
+        const tracks = srcStream?.getAudioTracks() ?? [];
+        if (tracks.length > 0) {
+          source = audioCtx.createMediaStreamSource(new MediaStream(tracks));
+        } else {
+          audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+          source = audioCtx.createMediaStreamSource(audioStream);
+        }
+
+      } else {
+        // webcam モード：マイク
+        audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        source = audioCtx.createMediaStreamSource(audioStream);
+      }
+
+      source.connect(delayNode);
+      audioOn = true;
+    } catch {}
+  }
+
+  function stopAudio() {
+    if (sourceMode === 'file' && srcVideo) srcVideo.muted = false;
+    audioCtx?.close();
+    audioStream?.getTracks().forEach(t => t.stop());
+    audioCtx = audioStream = delayNode = fbGain = recordingDest = null;
+    audioOn  = false;
+  }
+
+  // ── 録画 ─────────────────────────────────────────────────────
+  let recorder    = null;
+  let recChunks   = [];
+  let recordingOn = false;
+
+  function toggleRecording() {
+    if (recordingOn) { recorder.stop(); return; }
+    recChunks = [];
+    const stream = canvas.captureStream(30);
+    if (recordingDest) {
+      const t = recordingDest.stream.getAudioTracks()[0];
+      if (t) stream.addTrack(t);
+    }
+    const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+      ? 'video/webm;codecs=vp9,opus' : 'video/webm';
+    recorder = new MediaRecorder(stream, { mimeType: mime });
+    recorder.ondataavailable = e => { if (e.data.size > 0) recChunks.push(e.data); };
+    recorder.onstop = () => {
+      recordingOn = false;
+      recDot.style.display = 'none';
+      const blob = new Blob(recChunks, { type: 'video/webm' });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement('a');
+      const now  = new Date();
+      const p    = n => String(n).padStart(2, '0');
+      a.href     = url;
+      a.download = `reflection-${now.getFullYear()}${p(now.getMonth()+1)}${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}${p(now.getSeconds())}.webm`;
+      a.click();
+      URL.revokeObjectURL(url);
+    };
+    recorder.start();
+    recordingOn = true;
+    recDot.style.display = 'block';
+  }
+
+  // ── フルスクリーン ────────────────────────────────────────────
+  function toggleFullscreen() {
+    document.fullscreenElement
+      ? document.exitFullscreen()
+      : document.documentElement.requestFullscreen();
+  }
+
+  // ── ウェブカメラ PiP ──────────────────────────────────────────
+  async function togglePip() {
+    if (sourceMode === 'webcam') return;
+    if (pipActive) {
+      pipStream?.getTracks().forEach(t => t.stop());
+      pipVideo = pipStream = null;
+      pipActive = false;
+      return;
+    }
+    try {
+      pipStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      pipVideo  = document.createElement('video');
+      pipVideo.srcObject   = pipStream;
+      pipVideo.muted       = true;
+      pipVideo.playsInline = true;
+      await pipVideo.play();
+      pipActive = true;
+    } catch {}
+  }
+
+  // ── ソース起動 ────────────────────────────────────────────────
+  function disableButtons(v) {
+    document.querySelectorAll('.src-btn').forEach(b => b.disabled = v);
+  }
+
+  document.getElementById('btnCam').addEventListener('click', async () => {
+    disableButtons(true);
+    try {
+      srcStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      srcVideo  = makeVideo(srcStream);
+      await srcVideo.play();
+      sourceMode = 'webcam';
+      startLoop();
+    } catch { disableButtons(false); }
+  });
+
+  document.getElementById('btnScreen').addEventListener('click', async () => {
+    disableButtons(true);
+    try {
+      // audio: true でタブ音声の共有を要求（ユーザーが「音声を共有」にチェックすれば取得できる）
+      srcStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: true });
+      srcVideo  = makeVideo(srcStream);
+      await srcVideo.play();
+      srcStream.getVideoTracks()[0].addEventListener('ended', stop);
+      sourceMode = 'screen';
+      startLoop();
+    } catch { disableButtons(false); }
+  });
+
+  document.getElementById('btnFile').addEventListener('click', () => fileInput.click());
+
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+    disableButtons(true);
+    srcVideo             = document.createElement('video');
+    srcVideo.src         = URL.createObjectURL(file);
+    srcVideo.loop        = true;
+    srcVideo.muted       = false;
+    srcVideo.playsInline = true;
+    srcVideo.play().then(() => {
+      sourceMode = 'file';
+      startLoop();
+    }).catch(() => disableButtons(false));
+  });
+
+  function makeVideo(stream) {
+    const v = document.createElement('video');
+    v.srcObject   = stream;
+    v.muted       = true;
+    v.playsInline = true;
+    return v;
+  }
+
+  // ── ループ起動 ────────────────────────────────────────────────
+  function startLoop() {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+    buf.width     = canvas.width;
+    buf.height    = canvas.height;
+
+    drawCover(srcVideo, canvas.width, canvas.height);
+    bufCtx.drawImage(canvas, 0, 0);
+
+    setup.style.display  = 'none';
+    canvas.style.display = 'block';
+    loop();
+  }
+
+  // ── 描画ループ ────────────────────────────────────────────────
+  function loop() {
+    const W = canvas.width;
+    const H = canvas.height;
+
+    bufCtx.drawImage(canvas, 0, 0, W, H);
+    drawCover(srcVideo, W, H);
+
+    if (pipActive && pipVideo?.readyState >= 2) {
+      const pw = Math.round(W * 0.22);
+      const ph = Math.round(pw * (pipVideo.videoHeight / pipVideo.videoWidth || 0.75));
+      ctx.save();
+      ctx.translate(W - 16 + pw, H - 16 - ph);
+      ctx.scale(-1, 1);
+      ctx.drawImage(pipVideo, 0, 0, pw, ph);
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.translate(W / 2, H / 2);
+    ctx.rotate(rotAngle);
+    ctx.scale(frameScale, frameScale);
+    ctx.drawImage(buf, -W / 2, -H / 2, W, H);
+    ctx.restore();
+
+    rafId = requestAnimationFrame(loop);
+  }
+
+  // ── カバーフィット（webcam のみ左右反転）────────────────────────
+  function drawCover(video, W, H) {
+    if (!video || video.readyState < 2) {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, W, H);
+      return;
+    }
+    const vw    = video.videoWidth;
+    const vh    = video.videoHeight;
+    if (!vw || !vh) return;
+    const scale = Math.max(W / vw, H / vh);
+    const sw    = vw * scale;
+    const sh    = vh * scale;
+    const dx    = (W - sw) / 2;
+    const dy    = (H - sh) / 2;
+
+    if (sourceMode === 'webcam') {
+      ctx.save();
+      ctx.translate(W / 2, 0);
+      ctx.scale(-1, 1);
+      ctx.translate(-W / 2, 0);
+      ctx.drawImage(video, dx, dy, sw, sh);
+      ctx.restore();
+    } else {
+      ctx.drawImage(video, dx, dy, sw, sh);
+    }
+  }
+
+  // ── 停止 ─────────────────────────────────────────────────────
+  function stop() {
+    if (recordingOn) recorder.stop();
+    if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+    srcStream?.getTracks().forEach(t => t.stop());
+    pipStream?.getTracks().forEach(t => t.stop());
+    stopAudio();
+    if (document.fullscreenElement) document.exitFullscreen();
+    srcVideo = srcStream = pipVideo = pipStream = null;
+    pipActive = false;
+    sourceMode = null;
+    canvas.style.display = 'none';
+    setup.style.display  = 'flex';
+    disableButtons(false);
+    fileInput.value = '';
+  }
+
+  // ── キーボード ────────────────────────────────────────────────
+  const ROT_MAP = {
+    '1': 0,              '2': Math.PI / 36,
+    '3': Math.PI / 12,   '4': Math.PI / 4,
+    '5': Math.PI / 2,    '6': Math.PI * 2 / 3,
+    '7': Math.PI * 3/4,  '8': Math.PI * 5/6,
+    '9': Math.PI * 11/12,'0': Math.PI,
+  };
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { stop(); return; }
+    if (ROT_MAP[e.key] !== undefined) rotAngle = ROT_MAP[e.key];
+    if (e.key === '+' || e.key === '=') frameScale = Math.min(0.95, +(frameScale + 0.05).toFixed(2));
+    if (e.key === '-')                  frameScale = Math.max(0.30, +(frameScale - 0.05).toFixed(2));
+    if (e.key === 'a' || e.key === 'A') toggleAudio();
+    if (e.key === 'f' || e.key === 'F') toggleFullscreen();
+    if (e.key === 'r' || e.key === 'R') { if (canvas.style.display !== 'none') toggleRecording(); }
+    if (e.key === 'w' || e.key === 'W') togglePip();
+    if (e.key === 'ArrowRight' && delayNode) {
+      delayTime = Math.min(8.0, +(delayTime + 0.05).toFixed(2));
+      delayNode.delayTime.value = delayTime;
+    }
+    if (e.key === 'ArrowLeft' && delayNode) {
+      delayTime = Math.max(0.01, +(delayTime - 0.05).toFixed(2));
+      delayNode.delayTime.value = delayTime;
+    }
+    if (e.key === 'ArrowUp' && fbGain) {
+      fbLevel = Math.min(0.98, +(fbLevel + 0.02).toFixed(2));
+      fbGain.gain.value = fbLevel;
+    }
+    if (e.key === 'ArrowDown' && fbGain) {
+      fbLevel = Math.max(0.10, +(fbLevel - 0.02).toFixed(2));
+      fbGain.gain.value = fbLevel;
+    }
+  });
+})();
+</script>
+</body>
+</html>
