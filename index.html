@@ -51,8 +51,6 @@
       display: none;
       position: fixed;
       inset: 0;
-      width: 100vw;
-      height: 100vh;
     }
 
     #recDot {
@@ -294,19 +292,31 @@
   }
 
   // ── ループ起動 ────────────────────────────────────────────────
+  function resizeCanvas() {
+    const W = canvas.clientWidth;
+    const H = canvas.clientHeight;
+    if (!W || !H) return;
+    canvas.width  = W;
+    canvas.height = H;
+    buf.width     = W;
+    buf.height    = H;
+  }
+
   function startLoop() {
-    canvas.width  = window.innerWidth;
-    canvas.height = window.innerHeight;
-    buf.width     = canvas.width;
-    buf.height    = canvas.height;
+    setup.style.display  = 'none';
+    canvas.style.display = 'block';
+
+    resizeCanvas();
 
     drawCover(srcVideo, canvas.width, canvas.height);
     bufCtx.drawImage(canvas, 0, 0);
 
-    setup.style.display  = 'none';
-    canvas.style.display = 'block';
     loop();
   }
+
+  window.addEventListener('resize', () => {
+    if (rafId !== null) resizeCanvas();
+  });
 
   // ── 描画ループ ────────────────────────────────────────────────
   function loop() {
@@ -345,7 +355,11 @@
     }
     const vw    = video.videoWidth;
     const vh    = video.videoHeight;
-    if (!vw || !vh) return;
+    if (!vw || !vh) {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, W, H);
+      return;
+    }
     const scale = Math.max(W / vw, H / vh);
     const sw    = vw * scale;
     const sh    = vh * scale;
