@@ -189,6 +189,9 @@
     if (recordingDest) {
       const t = recordingDest.stream.getAudioTracks()[0];
       if (t) stream.addTrack(t);
+    } else if (sourceMode === 'screen') {
+      // ディレイエフェクトOFF時でも画面共有の音声トラックをそのまま録画に含める
+      srcStream?.getAudioTracks().forEach(t => stream.addTrack(t));
     }
     const mime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
       ? 'video/webm;codecs=vp9,opus' : 'video/webm';
